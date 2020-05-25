@@ -1,0 +1,121 @@
+ ## Azure Login ##
+# If Runbook for Azure Automation
+
+$connection = Get-AutomationConnection -Name AzureRunAsConnection
+connect-AzAccount -ServicePrincipal -Tenant $connection.TenantID -ApplicationID $connection.ApplicationID -CertificateThumbprint $connection.CertificateThumbprint
+
+# Create a state object and save it to the harddrive
+$serviceName = 'LetsEncrypt-staging'
+$acmeStateDir = "$env:TEMP";
+$dnsIdentifiers = @("$DnsName","www.$DnsName","clientzone.$DnsName");
+
+# Fetch the service directory and save it in the state
+Get-ACMEServiceDirectory -State $acmeStateDir -ServiceName $serviceName -PassThru;
+New-ACMEState -Path $acmeStateDir
+
+# Get the first anti-replay nonce
+New-ACMENonce -State $acmeStateDir
+
+# Create an account key. The state will make sure it's stored.
+New-ACMEAccountKey -State $acmeStateDir
+
+# Register the account key with the acme service. The account key will automatically be read from the state
+New-ACMEAccount -State $acmeStateDir -EmailAddresses $EmailAddress -AcceptTOS;
+
+# Create the order object at the ACME service.
+$order = New-ACMEOrder -State $acmeStateDir -Identifiers $arr;
+
+if ($null -ne $order) { # Will fetch the order
+    $order = Find-ACMEOrder -State $acmeStateDir -Identifiers $arr;
+}
+
+# Fetch the authorizations for that order
+$authorizations = @(Get-ACMEAuthorization -State $acmeStateDir -Order $order);
+
+foreach($authz in $authorizations) {
+    # Select a challenge to fullfill0
+    $challenge = Get-ACMEChallenge -State $acmeStateDir -Authorization $authZ -Type "http-01";
+
+    # Inspect the challenge data (uncomment, if you want to see the object)
+    # Depending on the challenge-type this will include different properties
+    # $challenge.Data;
+
+    $chFilename = [System.IO.Path]::Combine($challenge.Data.RelativeUrl);
+    $chDirectory = [System.IO.Path]::GetDirectoryName($chFilename);
+
+    # Ensure the challenge directory exists
+    if(-not (Test-Path $chDirectory)) {
+        New-Item -Path $chDirectory -ItemType Directory;
+    }
+
+    Set-Content -Path $chFilename -Value $challenge.Data.Content -NoNewline;
+
+$blobName = ".well-known/acme-challenge/" + $challenge.Token
+$storageAccount = Get-AzureRmStorageAccount -ResourceGroupName $STResourceGroupName -Name $storageName
+$ctx = $storageAccount.Context
+
+Set-AzureStorageBlobContent -File $chFilename -Container "public" -Context $ctx -Blob $blobName
+
+   <# do {
+        ## Sample content - not needed in production.
+        $prompt = "Make sure $($challenge.Data.AbsoluteUrl) is reachable from outside of your network. If yes, type 'y'";
+        $promptResult = $PSCmdlet.ShouldContinue($prompt, "URL reachable?");
+    } while(-not $promptResult);
+    #>
+    # Signal the ACME server that the challenge is ready
+    $challenge | Complete-ACMEChallenge -State $acmeStateDir;
+}
+
+# Wait a little bit and update the order, until we see the status 'ready' or 'invalid'
+while($order.Status -notin ("ready","invalid")) {
+    Start-Sleep -Seconds 10;
+    $order | Update-ACMEOrder -State $acmeStateDir -PassThru;
+}
+
+
+# Should the order get invalid, use Get-ACMEAuthorizationError to list error details.
+if($order.Status -ieq ("invalid")) {
+    $order | Get-ACMEAuthorizationError -State $acmeStateDir;
+    throw "Order was invalid";
+}
+
+
+if ($null -ne $order) { # Will fetch the order
+    $order = Find-ACMEOrder -State $acmeStateDir -Identifiers $arr;
+}
+
+# Wait a little bit and update the order, until we see the status 'ready' or 'invalid'
+while($order.Status -notin ("ready","invalid")) {
+    Start-Sleep -Seconds 10;
+    $order | Update-ACMEOrder $acmeStateDir -PassThru;
+}
+
+if($order.Status -eq "invalid") {
+    throw "Your order has been marked as invalid - certificate cannot be issued."
+}
+
+$certKey = new-ACMECertificateKey -Path "$acmeStateDir\$domain.key.xml";
+
+# Complete the order - this will issue a certificate singing request
+ Complete-ACMEOrder -State $acmeStateDir -Order $order -CertificateKey $certKey; 
+
+
+# Now we wait until the ACME service provides the certificate url
+while(-not $order.CertificateUrl) {
+    Start-Sleep -Seconds 15
+    $order | Update-Order -State $acmeStateDir -PassThru
+}
+
+# As soon as the url shows up we can create the PFX
+$password = ConvertTo-SecureString -String "12345678" -Force -AsPlainText
+Export-ACMECertificate $acmeStateDir -Order $order -CertificateKey $certKey -Path "$env:TEMP\$domain.pfx" -Password $password;
+
+# Delete blob to check DNS
+Remove-AzureStorageBlob -Container "public" -Context $ctx -Blob $blobName
+
+### RENEW APPLICATION GATEWAY CERTIFICATE ###
+ foreach($AGOldCertName in $arr){
+$appgw = Get-AzureRmApplicationGateway -ResourceGroupName $AGResourceGroupName -Name $AGName
+Set-AzApplicationGatewaySSLCertificate -Name $AGOldCertName -ApplicationGateway $appgw -CertificateFile "$acmeStateDir\$domain.pfx" -Password $password
+Set-AzapplicationGateway -ApplicationGateway $appgw
+} 
